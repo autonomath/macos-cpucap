@@ -1,0 +1,787 @@
+import Foundation
+import Darwin
+
+let PROC_PIDPATHINFO_MAXSIZE: Int = 4096
+let MAXCOMLEN: Int = 16
+
+class ProcessMonitor: ObservableObject {
+    @Published var processes: [AppProcessInfo] = []
+    @Published var summary: CPUSummary = CPUSummary()
+    @Published var cpuHistory: [CPUHistoryPoint] = []
+    @Published var isEnabled: Bool = true
+    @Published var showSystemProcesses: Bool = false
+    @Published var samplingInterval: Double = 2.0  // Seconds between samples
+    
+    private var timer: Timer?
+    private var previousSamples: [pid_t: UInt64] = [:]
+    private var previousTimestamp: CFAbsoluteTime = 0
+    private let minCPUThreshold: Double = 0.1  // Show processes using >0.1% CPU
+    
+    // Reference to RuleStore for checking modes
+    private weak var ruleStore: RuleStore?
+    
+    // Cache for process start times (doesn't change)
+    private var startTimeCache: [pid_t: Date] = [:]
+    
+    // Per-core CPU sampling for P-core/E-core breakdown
+    private var previousCoreTicks: [(user: UInt64, system: UInt64, idle: UInt64, nice: UInt64)]?
+    
+    // Mach timebase for converting CPU times to nanoseconds
+    private let timebaseNumer: Double
+    private let timebaseDenom: Double
+    
+    // System processes to optionally hide
+    private let systemProcesses = Set([
+        // Core system
+        "kernel_task", "launchd", "WindowServer", "loginwindow",
+        "systemstats", "coreaudiod", "coreduetd", "distnoted",
+        // Daemons
+        "cfprefsd", "containermanagerd", "coreservicesd", "diskarbitrationd",
+        "fseventsd", "logd", "mds", "mds_stores", "mdworker", "mdworker_shared",
+        "notifyd", "opendirectoryd", "powerd", "securityd", "syslogd", "thermalmonitord",
+        "usbd", "useractivityd", "warmd", "watchdogd",
+        // Graphics/display
+        "MTLCompilerService", "VTDecoderXPCService", "gpumemd", "hidd",
+        // Network
+        "CommCenter", "identityservicesd", "mDNSResponder", "netbiosd", "networkd",
+        "rapportd", "symptomsd", "trustd", "WiFiAgent",
+        // Apple services
+        "AMPDeviceDiscoveryAgent", "AMPLibraryAgent", "askpermissiond", "biomed",
+        "cloudd", "cloudpaird", "commerced", "ctkd", "familycircled", "findmydeviced",
+        "gamecontrollerd", "iconservicesagent", "legacyScreenSaver", "locationd",
+        "nsurlsessiond", "parsecd", "pbs", "remindd", "routined", "runningboardd",
+        "screencaptureui", "sharingd", "siriactionsd", "suggestd", "translationd",
+        "transparencyd", "universalaccessd", "usernoted", "videosubscriptionsd",
+        // XPC services (generic pattern handled separately)
+        "screencapture", "SystemUIServer", "ControlCenter", "NotificationCenter"
+    ])
+    
+    // Always hide ourselves - no point capping CPU Cap
+    private let hiddenProcesses = Set(["CPU Cap", "CPUCap"])
+    
+    private var coreCount: Int {
+        Foundation.ProcessInfo.processInfo.activeProcessorCount
+    }
+    
+    init() {
+        // Get mach timebase info for converting CPU times
+        var timebaseInfo = mach_timebase_info_data_t()
+        mach_timebase_info(&timebaseInfo)
+        timebaseNumer = Double(timebaseInfo.numer)
+        timebaseDenom = Double(timebaseInfo.denom)
+        
+        // Get core counts
+        summary.pCoreCount = getPCoreCount()
+        summary.eCoreCount = getECoreCount()
+        
+        // Delay start to ensure run loop is ready
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.start()
+        }
+    }
+    
+    private func getPCoreCount() -> Int {
+        var count: Int = 0
+        var size = MemoryLayout<Int>.size
+        sysctlbyname("hw.perflevel0.logicalcpu", &count, &size, nil, 0)
+        return count > 0 ? count : 6  // Default for M1
+    }
+    
+    private func getECoreCount() -> Int {
+        var count: Int = 0
+        var size = MemoryLayout<Int>.size
+        sysctlbyname("hw.perflevel1.logicalcpu", &count, &size, nil, 0)
+        return count > 0 ? count : 4  // Default for M1
+    }
+    
+    private(set) var isMenuOpen: Bool = false
+    
+    // Separate timer for lightweight icon updates when menu is closed
+    private var iconTimer: Timer?
+    private static let iconUpdateInterval: Double = 5.0  // Slow polling for icon only
+    
+    func setRuleStore(_ store: RuleStore) {
+        self.ruleStore = store
+    }
+    
+    func start() {
+        guard isEnabled else { return }
+        
+        if isMenuOpen {
+            startFullSampling()
+        } else {
+            startIconSampling()
+        }
+    }
+    
+    /// Full process sampling - only when menu is open
+    private func startFullSampling() {
+        stopAllTimers()
+        
+        timer = Timer.scheduledTimer(withTimeInterval: samplingInterval, repeats: true) { [weak self] _ in
+            guard let self = self, self.isEnabled else { return }
+            self.sample()
+        }
+        RunLoop.main.add(timer!, forMode: .common)
+    }
+    
+    /// Lightweight sampling - just core CPU for the menu bar icon
+    private func startIconSampling() {
+        stopAllTimers()
+        
+        iconTimer = Timer.scheduledTimer(withTimeInterval: Self.iconUpdateInterval, repeats: true) { [weak self] _ in
+            guard let self = self, self.isEnabled else { return }
+            self.sampleIconOnly()
+        }
+        RunLoop.main.add(iconTimer!, forMode: .common)
+    }
+    
+    /// Only sample per-core CPU stats for the menu bar icon - no process enumeration
+    private func sampleIconOnly() {
+        let (coreTotalCPU, pCoreCPU, eCoreCPU) = sampleCoreCPU()
+        
+        DispatchQueue.main.async {
+            self.summary.totalCPU = coreTotalCPU
+            self.summary.pCoreCPU = pCoreCPU
+            self.summary.eCoreCPU = eCoreCPU
+        }
+    }
+    
+    private func stopAllTimers() {
+        timer?.invalidate()
+        timer = nil
+        iconTimer?.invalidate()
+        iconTimer = nil
+    }
+    
+    func setSamplingInterval(_ interval: Double) {
+        samplingInterval = max(0.5, min(10.0, interval))
+        if isMenuOpen {
+            startFullSampling()
+        }
+    }
+    
+    func stop() {
+        stopAllTimers()
+    }
+    
+    func menuOpened() {
+        isMenuOpen = true
+        sample()  // Immediate full sample for responsiveness
+        startFullSampling()
+    }
+    
+    func menuClosed() {
+        isMenuOpen = false
+        startIconSampling()  // Switch to lightweight sampling
+    }
+    
+    func toggle() {
+        isEnabled.toggle()
+        if isEnabled {
+            start()
+        } else {
+            stop()
+        }
+    }
+    
+    private func sample() {
+        let currentTimestamp = CFAbsoluteTimeGetCurrent()
+        let now = Date()
+        
+        // Get all PIDs
+        var numPids: Int32 = proc_listallpids(nil, 0)
+        guard numPids > 0 else { return }
+        
+        var pids = [pid_t](repeating: 0, count: Int(numPids))
+        numPids = proc_listallpids(&pids, Int32(MemoryLayout<pid_t>.size * Int(numPids)))
+        
+        guard numPids > 0 else { return }
+        pids = Array(pids.prefix(Int(numPids)))
+        
+        // Collect process data
+        var currentSamples: [pid_t: UInt64] = [:]
+        var processData: [pid_t: (name: String, bundlePath: String?, cpuTimeNs: Double, startTime: Date?)] = [:]
+        
+        for pid in pids {
+            guard pid > 0 else { continue }
+            
+            var rusage = rusage_info_v4()
+            let result = withUnsafeMutablePointer(to: &rusage) { ptr in
+                ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rusagePtr in
+                    proc_pid_rusage(pid, RUSAGE_INFO_V4, rusagePtr)
+                }
+            }
+            
+            guard result == 0 else { continue }
+            
+            let cpuTimeMach = rusage.ri_user_time &+ rusage.ri_system_time
+            currentSamples[pid] = cpuTimeMach
+            
+            // Convert to nanoseconds
+            let cpuTimeNs = Double(cpuTimeMach) * timebaseNumer / timebaseDenom
+            
+            // Get process start time (cached - it never changes)
+            var startTime: Date? = startTimeCache[pid]
+            if startTime == nil {
+                var bsdInfo = proc_bsdinfo()
+                let bsdSize = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdInfo, Int32(MemoryLayout<proc_bsdinfo>.size))
+                if bsdSize > 0 {
+                    let startSec = Double(bsdInfo.pbi_start_tvsec)
+                    let startUsec = Double(bsdInfo.pbi_start_tvusec)
+                    startTime = Date(timeIntervalSince1970: startSec + startUsec / 1_000_000)
+                    startTimeCache[pid] = startTime
+                }
+            }
+            
+            let (name, bundlePath) = getProcessInfo(pid: pid)
+            processData[pid] = (name, bundlePath, cpuTimeNs, startTime)
+        }
+        
+        // Calculate CPU percentages (instantaneous) and lifetime averages
+        guard previousTimestamp > 0 else {
+            previousSamples = currentSamples
+            previousTimestamp = currentTimestamp
+            return
+        }
+        
+        let timeDeltaSec = currentTimestamp - previousTimestamp
+        guard timeDeltaSec > 0 else { return }
+        let timeDeltaNs = timeDeltaSec * 1_000_000_000
+        
+        // Group by app name
+        var appData: [String: (cpuNow: Double, cpuAvg: Double, pids: [pid_t], bundlePath: String?)] = [:]
+        var totalCPUUsage: Double = 0.0
+        
+        for (pid, data) in processData {
+            let appName = cleanAppName(data.name)
+            
+            // Always skip ourselves
+            if hiddenProcesses.contains(appName) {
+                continue
+            }
+            
+            // Skip system processes if not showing them
+            if !showSystemProcesses {
+                if systemProcesses.contains(appName) {
+                    continue
+                }
+                // Also skip processes that look like system daemons
+                // Pattern: all lowercase, ends in 'd', short name (e.g., "cfprefsd", "logd")
+                if appName.hasSuffix("d") && appName.count < 20 && !appName.contains(" ") {
+                    if appName.allSatisfy({ $0.isLowercase || $0.isNumber }) {
+                        continue
+                    }
+                }
+                // Skip XPC services (but not app helpers like "Chrome Helper")
+                if appName.contains("XPCService") {
+                    continue
+                }
+                // Skip system agents (but keep ones that are part of apps)
+                if appName.hasSuffix("Agent") && !appName.contains(" ") {
+                    continue
+                }
+            }
+            
+            // Calculate instantaneous CPU %
+            var cpuNow: Double = 0
+            if let prevMach = previousSamples[pid], let currMach = currentSamples[pid] {
+                let deltaMach = currMach > prevMach ? currMach - prevMach : 0
+                let deltaNs = Double(deltaMach) * timebaseNumer / timebaseDenom
+                cpuNow = (deltaNs / timeDeltaNs) * 100.0
+            }
+            
+            // Calculate lifetime average CPU %
+            // cpuAvg = totalCpuTime / processAge * 100
+            var cpuAvg: Double = 0
+            if let startTime = data.startTime {
+                let ageSeconds = now.timeIntervalSince(startTime)
+                if ageSeconds > 1 {  // Avoid division by very small numbers
+                    let ageNs = ageSeconds * 1_000_000_000
+                    cpuAvg = (data.cpuTimeNs / ageNs) * 100.0
+                }
+            }
+            
+            totalCPUUsage += cpuNow
+            
+            if var existing = appData[appName] {
+                existing.cpuNow += cpuNow
+                existing.cpuAvg += cpuAvg
+                existing.pids.append(pid)
+                if existing.bundlePath == nil {
+                    existing.bundlePath = data.bundlePath
+                }
+                appData[appName] = existing
+            } else {
+                appData[appName] = (cpuNow, cpuAvg, [pid], data.bundlePath)
+            }
+        }
+        
+        // Get reference to limiter for throttling status
+        let limiter = CPULimiter.shared
+        
+        // Convert to AppProcessInfo array
+        // Filter by lifetime average (stable) instead of instantaneous (flickery)
+        let newProcesses = appData
+            .compactMap { (appName, data) -> AppProcessInfo? in
+                // Get mode from RuleStore (source of truth), fallback to limiter
+                let mode = self.ruleStore?.modeForApp(appName) ?? limiter.getModeForApp(appName)
+                let hasMode = mode != nil
+                
+                // Show if lifetime average >= threshold OR has a mode set
+                guard data.cpuAvg >= minCPUThreshold || hasMode else {
+                    return nil
+                }
+                
+                let isThrottling = limiter.isThrottling(appName)
+                
+                let status: ProcessStatus
+                if let mode = mode {
+                    switch mode {
+                    case .fullSpeed:
+                        status = .running
+                    case .efficiency:
+                        status = isThrottling ? .slowed : .running
+                    case .stopped:
+                        status = isThrottling ? .stopped : .running
+                    }
+                } else {
+                    status = .running
+                }
+                
+                return AppProcessInfo(
+                    id: appName,
+                    appName: appName,
+                    pids: data.pids,
+                    cpuPercent: data.cpuNow,
+                    cpuAverage: data.cpuAvg,
+                    bundlePath: data.bundlePath,
+                    status: status,
+                    throttleMode: mode
+                )
+            }
+        
+        // Calculate CPU by category for chart
+        var eLimitedCPU: Double = 0
+        var autoStoppedCPU: Double = 0
+        var unlimitedCPU: Double = 0
+        
+        for process in newProcesses {
+            switch process.throttleMode {
+            case .efficiency:
+                eLimitedCPU += process.cpuPercent
+            case .stopped:
+                autoStoppedCPU += process.cpuPercent
+            case .fullSpeed, .none:
+                unlimitedCPU += process.cpuPercent
+            }
+        }
+        
+        // Update history for graph
+        let historyPoint = CPUHistoryPoint(
+            timestamp: Date(),
+            totalCPU: totalCPUUsage / Double(coreCount),
+            eLimitedCPU: eLimitedCPU,
+            autoStoppedCPU: autoStoppedCPU,
+            unlimitedCPU: unlimitedCPU
+        )
+        
+        // Sample per-core CPU for P-core/E-core breakdown (and consistent Total)
+        let (coreTotalCPU, pCoreCPU, eCoreCPU) = sampleCoreCPU()
+        
+        DispatchQueue.main.async {
+            self.processes = newProcesses
+            // Use core-based total so P + E = Total exactly
+            self.summary.totalCPU = coreTotalCPU
+            self.summary.pCoreCPU = pCoreCPU
+            self.summary.eCoreCPU = eCoreCPU
+            
+            // Keep last 60 points (~2 minutes at 2s interval)
+            self.cpuHistory.append(historyPoint)
+            if self.cpuHistory.count > 60 {
+                self.cpuHistory.removeFirst()
+            }
+            
+            // Apply rules to any newly appeared processes
+            self.ruleStore?.reapplyRulesIfNeeded()
+        }
+        
+        previousSamples = currentSamples
+        previousTimestamp = currentTimestamp
+        
+        // Clean up stale cache entries (PIDs that no longer exist)
+        let currentPids = Set(currentSamples.keys)
+        startTimeCache = startTimeCache.filter { currentPids.contains($0.key) }
+    }
+    
+    /// Stable sort - only reorder when a process jumps significantly
+    private func stableSortProcesses(_ newProcesses: [AppProcessInfo]) -> [AppProcessInfo] {
+        guard !processes.isEmpty else {
+            return newProcesses.sorted(by: { $0.cpuPercent > $1.cpuPercent })
+        }
+        
+        // Keep existing order, just update values
+        var result: [AppProcessInfo] = []
+        var remaining = newProcesses
+        
+        // First, keep existing processes in their current order
+        for oldProcess in processes {
+            if let idx = remaining.firstIndex(where: { $0.appName == oldProcess.appName }) {
+                result.append(remaining[idx])
+                remaining.remove(at: idx)
+            }
+        }
+        
+        // Add any new processes at the end, sorted by CPU
+        remaining.sort { $0.cpuPercent > $1.cpuPercent }
+        result.append(contentsOf: remaining)
+        
+        // Only do a full re-sort if top process changed significantly
+        let shouldResort = result.count > 1 && 
+            result[0].cpuPercent < result[1].cpuPercent - 15.0  // 15% threshold to swap
+        
+        if shouldResort {
+            return result.sorted { $0.cpuPercent > $1.cpuPercent }
+        }
+        
+        return result
+    }
+    
+    private func getProcessInfo(pid: pid_t) -> (name: String, bundlePath: String?) {
+        var pathBuffer = [CChar](repeating: 0, count: PROC_PIDPATHINFO_MAXSIZE)
+        let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        
+        var name = "Unknown"
+        var bundlePath: String? = nil
+        
+        if pathLength > 0 {
+            let path = String(cString: pathBuffer)
+            bundlePath = path
+            
+            if let appRange = path.range(of: ".app/") {
+                let appPath = String(path[..<appRange.lowerBound])  // Get path before ".app"
+                name = (appPath as NSString).lastPathComponent  // Just the app name without .app
+            } else if path.hasSuffix(".app") {
+                name = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+            } else {
+                name = (path as NSString).lastPathComponent
+            }
+        } else {
+            var nameBuffer = [CChar](repeating: 0, count: MAXCOMLEN + 1)
+            _ = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+            if nameBuffer[0] != 0 {
+                name = String(cString: nameBuffer)
+            }
+        }
+        
+        // Handle our own app - might show as "CPUCap", "CPU Cap", or truncated
+        if name == "CPUCap" || name == "CPU Cap" || name.hasPrefix("CPU Cap") {
+            name = "CPU Cap"
+        }
+        
+        // If still Unknown, try to get a better name
+        if name == "Unknown" {
+            var nameBuffer = [CChar](repeating: 0, count: MAXCOMLEN + 1)
+            _ = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+            if nameBuffer[0] != 0 {
+                name = String(cString: nameBuffer)
+            }
+        }
+        
+        return (name, bundlePath)
+    }
+    
+    /// Get the actual executable name (for detail view sub-processes)
+    private func getExecutableName(pid: pid_t) -> String {
+        var pathBuffer = [CChar](repeating: 0, count: PROC_PIDPATHINFO_MAXSIZE)
+        let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        
+        if pathLength > 0 {
+            let path = String(cString: pathBuffer)
+            return (path as NSString).lastPathComponent  // e.g., "Spotify Helper (Renderer)"
+        }
+        
+        // Fallback to proc_name
+        var nameBuffer = [CChar](repeating: 0, count: MAXCOMLEN + 1)
+        _ = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+        if nameBuffer[0] != 0 {
+            return String(cString: nameBuffer)
+        }
+        
+        return "PID \(pid)"
+    }
+    
+    private func cleanAppName(_ name: String) -> String {
+        let helpers: [String: String] = [
+            // WebKit processes - don't group as Safari, they're used by many apps
+            "com.apple.WebKit.WebContent": "WebKit",
+            "com.apple.WebKit.Networking": "WebKit",
+            "com.apple.WebKit.GPU": "WebKit",
+            "Google Chrome Helper": "Chrome",
+            "Google Chrome Helper (GPU)": "Chrome",
+            "Google Chrome Helper (Renderer)": "Chrome",
+            "Google Chrome Canary Helper": "Chrome Canary",
+            "Google Chrome Canary Helper (GPU)": "Chrome Canary",
+            "Google Chrome Canary Helper (Renderer)": "Chrome Canary",
+            "Cursor Helper": "Cursor",
+            "Cursor Helper (GPU)": "Cursor",
+            "Cursor Helper (Plugin)": "Cursor",
+            "Cursor Helper (Renderer)": "Cursor",
+            "Code Helper": "VS Code",
+            "Code Helper (GPU)": "VS Code",
+            "Code Helper (Plugin)": "VS Code",
+            "Code Helper (Renderer)": "VS Code",
+            "Electron Helper": "Electron",
+            "node": "Node.js",
+            "mds": "Spotlight",
+            "mds_stores": "Spotlight",
+            "mdworker": "Spotlight",
+            "mdworker_shared": "Spotlight",
+            "spotlightknowledged": "Spotlight",
+            "Spotlight": "Spotlight",
+            "photoanalysisd": "Photos",
+            "photolibraryd": "Photos",
+            "IMAPStore": "Mail",
+            "backupd": "Time Machine",
+            "backupd-helper": "Time Machine",
+            "WindowServer": "WindowServer",
+        ]
+        
+        if let mapped = helpers[name] {
+            return mapped
+        }
+        
+        // WebKit processes are used by many apps (Mail, Notes, etc.), not just Safari
+        if name.contains("WebContent") || name.contains("com.apple.WebKit") {
+            return "WebKit"
+        }
+        
+        if name.contains("Chrome Canary") {
+            return "Chrome Canary"
+        }
+        if name.contains("Chrome Helper") || name == "Google Chrome" {
+            return "Chrome"
+        }
+        
+        if name.contains("Cursor Helper") {
+            return "Cursor"
+        }
+        
+        if name.contains("Code Helper") {
+            return "VS Code"
+        }
+        
+        if name.contains("Wire Helper") {
+            return "Wire"
+        }
+        
+        if name.contains("Slack Helper") {
+            return "Slack"
+        }
+        
+        if name.contains("Discord Helper") {
+            return "Discord"
+        }
+        
+        if name.contains("zoom") || name.contains("Zoom") {
+            return "Zoom"
+        }
+        
+        if name.contains("Teams Helper") || name.contains("Microsoft Teams") {
+            return "Teams"
+        }
+        
+        if name.hasSuffix(" Helper") || name.contains(" Helper (") {
+            let baseName = name
+                .replacingOccurrences(of: " Helper (Renderer)", with: "")
+                .replacingOccurrences(of: " Helper (GPU)", with: "")
+                .replacingOccurrences(of: " Helper (Plugin)", with: "")
+                .replacingOccurrences(of: " Helper", with: "")
+            if !baseName.isEmpty {
+                return baseName
+            }
+        }
+        
+        return name
+    }
+    
+    func pidsForApp(_ appName: String) -> [pid_t] {
+        processes.first(where: { $0.appName == appName })?.pids ?? []
+    }
+    
+    /// Get detailed info for an app including all sub-processes
+    func getDetailedInfo(for appName: String) -> AppDetailInfo? {
+        guard let appInfo = processes.first(where: { $0.appName == appName }) else {
+            return nil
+        }
+        
+        var subProcesses: [SubProcessInfo] = []
+        let timeDeltaSec = max(0.1, CFAbsoluteTimeGetCurrent() - previousTimestamp)
+        let timeDeltaNs = timeDeltaSec * 1_000_000_000
+        
+        for pid in appInfo.pids {
+            // Get actual executable name (e.g., "Spotify Helper (Renderer)")
+            let originalName = getExecutableName(pid: pid)
+            let (_, bundlePath) = getProcessInfo(pid: pid)
+            
+            // Try to get resource usage (may fail for some processes)
+            var memoryBytes: UInt64 = 0
+            var diskRead: UInt64 = 0
+            var diskWrite: UInt64 = 0
+            var cpuPercent: Double = 0
+            
+            var rusage = rusage_info_v4()
+            let result = withUnsafeMutablePointer(to: &rusage) { ptr in
+                ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rusagePtr in
+                    proc_pid_rusage(pid, RUSAGE_INFO_V4, rusagePtr)
+                }
+            }
+            
+            if result == 0 {
+                memoryBytes = rusage.ri_phys_footprint
+                diskRead = rusage.ri_diskio_bytesread
+                diskWrite = rusage.ri_diskio_byteswritten
+                
+                // Calculate CPU for this specific PID
+                let currentCPUTime = rusage.ri_user_time &+ rusage.ri_system_time
+                if let prevCPUTime = previousSamples[pid] {
+                    let cpuDeltaMach = currentCPUTime > prevCPUTime ? currentCPUTime - prevCPUTime : 0
+                    let cpuDeltaNs = Double(cpuDeltaMach) * timebaseNumer / timebaseDenom
+                    cpuPercent = (cpuDeltaNs / timeDeltaNs) * 100.0
+                }
+            }
+            
+            let subProcess = SubProcessInfo(
+                id: pid,
+                pid: pid,
+                originalName: originalName,
+                cpuPercent: cpuPercent,
+                memoryBytes: memoryBytes,
+                diskReadBytes: diskRead,
+                diskWriteBytes: diskWrite,
+                bundlePath: bundlePath
+            )
+            subProcesses.append(subProcess)
+        }
+        
+        // Sort by CPU descending
+        subProcesses.sort { $0.cpuPercent > $1.cpuPercent }
+        
+        // Get bundle identifier and version from Info.plist
+        var bundleIdentifier: String? = nil
+        var version: String? = nil
+        
+        if let bundlePath = appInfo.bundlePath,
+           let appRange = bundlePath.range(of: ".app") {
+            let appPath = String(bundlePath[..<appRange.upperBound])
+            let infoPlistPath = appPath + "/Contents/Info.plist"
+            
+            if let plistData = FileManager.default.contents(atPath: infoPlistPath),
+               let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any] {
+                bundleIdentifier = plist["CFBundleIdentifier"] as? String
+                version = plist["CFBundleShortVersionString"] as? String
+                if let build = plist["CFBundleVersion"] as? String, version != nil {
+                    version = "\(version!) (\(build))"
+                }
+            }
+        }
+        
+        return AppDetailInfo(
+            appName: appName,
+            bundlePath: appInfo.bundlePath,
+            bundleIdentifier: bundleIdentifier,
+            version: version,
+            subProcesses: subProcesses
+        )
+    }
+    
+    // MARK: - Per-Core CPU Sampling
+    
+    /// Sample CPU usage per core and calculate Total, P-core, and E-core percentages
+    private func sampleCoreCPU() -> (total: Double, pCore: Double, eCore: Double) {
+        var numCPUs: natural_t = 0
+        var cpuInfo: processor_info_array_t?
+        var numCPUInfo: mach_msg_type_number_t = 0
+        
+        let err = host_processor_info(mach_host_self(),
+                                       PROCESSOR_CPU_LOAD_INFO,
+                                       &numCPUs,
+                                       &cpuInfo,
+                                       &numCPUInfo)
+        
+        guard err == KERN_SUCCESS, let info = cpuInfo else {
+            return (0, 0, 0)
+        }
+        
+        defer {
+            // Deallocate the memory
+            vm_deallocate(mach_task_self_,
+                         vm_address_t(bitPattern: info),
+                         vm_size_t(numCPUInfo) * vm_size_t(MemoryLayout<integer_t>.size))
+        }
+        
+        let cpuLoadInfo = UnsafeBufferPointer(start: info, count: Int(numCPUInfo))
+        
+        // Extract current ticks for each core
+        var currentTicks: [(user: UInt64, system: UInt64, idle: UInt64, nice: UInt64)] = []
+        
+        for i in 0..<Int(numCPUs) {
+            let offset = Int(CPU_STATE_MAX) * i
+            let user = UInt64(cpuLoadInfo[offset + Int(CPU_STATE_USER)])
+            let system = UInt64(cpuLoadInfo[offset + Int(CPU_STATE_SYSTEM)])
+            let idle = UInt64(cpuLoadInfo[offset + Int(CPU_STATE_IDLE)])
+            let nice = UInt64(cpuLoadInfo[offset + Int(CPU_STATE_NICE)])
+            currentTicks.append((user, system, idle, nice))
+        }
+        
+        // Need previous sample to calculate delta
+        guard let previous = previousCoreTicks, previous.count == currentTicks.count else {
+            previousCoreTicks = currentTicks
+            return (0, 0, 0)
+        }
+        
+        // Calculate usage for P-cores and E-cores
+        var pCoreUsed: UInt64 = 0
+        var pCoreTotal: UInt64 = 0
+        var eCoreUsed: UInt64 = 0
+        var eCoreTotal: UInt64 = 0
+        
+        let pCoreCount = summary.pCoreCount
+        
+        for i in 0..<currentTicks.count {
+            let curr = currentTicks[i]
+            let prev = previous[i]
+            
+            let userDelta = curr.user > prev.user ? curr.user - prev.user : 0
+            let systemDelta = curr.system > prev.system ? curr.system - prev.system : 0
+            let idleDelta = curr.idle > prev.idle ? curr.idle - prev.idle : 0
+            let niceDelta = curr.nice > prev.nice ? curr.nice - prev.nice : 0
+            
+            let used = userDelta + systemDelta + niceDelta
+            let total = used + idleDelta
+            
+            if i < pCoreCount {
+                // P-core
+                pCoreUsed += used
+                pCoreTotal += total
+            } else {
+                // E-core
+                eCoreUsed += used
+                eCoreTotal += total
+            }
+        }
+        
+        // Store for next sample
+        previousCoreTicks = currentTicks
+        
+        // Calculate percentages as share of TOTAL CPU capacity
+        // This way P-core% + E-core% = Total%
+        let totalCapacity = pCoreTotal + eCoreTotal
+        
+        let pCorePercent = totalCapacity > 0 ? Double(pCoreUsed) / Double(totalCapacity) * 100.0 : 0
+        let eCorePercent = totalCapacity > 0 ? Double(eCoreUsed) / Double(totalCapacity) * 100.0 : 0
+        let totalPercent = pCorePercent + eCorePercent
+        
+        return (totalPercent, pCorePercent, eCorePercent)
+    }
+}
